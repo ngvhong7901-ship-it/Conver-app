@@ -465,84 +465,57 @@
   //
   // Math (stage 7): KaTeX renders each formula with `output: "htmlAndMathml"`
   // by default, so every rendered formula already carries a real <math>
-  // (MathML) tree alongside the visual HTML. We run that MathML through
-  // Microsoft's own MML2OMML.XSL stylesheet (client-side, via the browser's
-  // built-in XSLTProcessor) to get OMML — the XML Word actually stores
-  // formulas in — then splice that OMML straight into the .docx using
-  // docx.js's ImportedXmlComponent. Net effect: formulas land in Word as
-  // live, double-click-to-edit equations, not pictures or plain text.
-  // If the stylesheet can't be loaded/applied for some reason (offline,
-  // unsupported browser, a malformed formula), each affected formula falls
-  // back individually to its LaTeX source wrapped in $…$ / $$…$$ so nothing
-  // is silently lost.
+  // (MathML) tree alongside the visual HTML. We convert that MathML to OMML
+  // — the XML Word actually stores formulas in — using the `mathml2omml`
+  // library (bundled locally as `mathml2omml.min.js`, global `MathML2OMML`),
+  // then splice that OMML straight into the .docx using docx.js's
+  // ImportedXmlComponent. Net effect: formulas land in Word as live,
+  // double-click-to-edit equations, not pictures or plain text.
+  //
+  // Previously this used the browser's XSLTProcessor + a third-party
+  // MML2OMML.XSL fetched from GitHub at export time. That had two problems:
+  // it needed a network round-trip on every export (a single point of
+  // failure), and that particular stylesheet mis-handled some common
+  // structures (e.g. matrices/binomials losing their closing bracket).
+  // `mathml2omml` runs fully offline/synchronously and produced correct
+  // output for everything we tested it against, including those cases.
+  //
+  // If conversion still can't produce usable OMML for some formula (a
+  // genuinely unsupported structure, or the library missing at runtime),
+  // that one formula falls back to its LaTeX source wrapped in $…$ / $$…$$
+  // so nothing is silently lost.
 
-  const MML2OMML_URL =
-    "https://raw.githubusercontent.com/lavakumarThatisetti/Extracting-Math-formulas-using-Apache-poi-in-java/master/MML2OMML.XSL";
   const OMML_NS = "http://schemas.openxmlformats.org/officeDocument/2006/math";
-
-  // Cached across the whole export: `null` = not yet attempted, a real
-  // XSLTProcessor instance = ready, `false` = tried and unavailable.
-  let xsltProcessor = null;
-
-  async function ensureXsltProcessor() {
-    if (xsltProcessor !== null) return xsltProcessor;
-    if (typeof XSLTProcessor === "undefined" || typeof DOMParser === "undefined") {
-      xsltProcessor = false;
-      return false;
-    }
-    try {
-      const res = await fetch(MML2OMML_URL);
-      if (!res.ok) throw new Error("HTTP " + res.status);
-      const xsltText = await res.text();
-      const xsltDoc = new DOMParser().parseFromString(xsltText, "application/xml");
-      if (xsltDoc.querySelector("parsererror")) throw new Error("Không phân tích được XSLT");
-      const proc = new XSLTProcessor();
-      proc.importStylesheet(xsltDoc);
-      xsltProcessor = proc;
-    } catch (e) {
-      console.warn("Không tải được MML2OMML.XSL — công thức sẽ xuất dạng văn bản LaTeX thay thế.", e);
-      xsltProcessor = false;
-    }
-    return xsltProcessor;
-  }
 
   // Converts a rendered KaTeX node's MathML into an OMML XML string
   // ("<m:oMath …>…</m:oMath>"), or null if that isn't possible right now.
   function mathNodeToOmmlXml(katexRootEl) {
-    if (!xsltProcessor) return null;
+    if (!window.MathML2OMML || typeof MathML2OMML.mml2omml !== "function") return null;
     try {
       const mathEl = katexRootEl.matches("math") ? katexRootEl : katexRootEl.querySelector("math");
       if (!mathEl) return null;
 
       // Drop KaTeX's <annotation>/<annotation-xml> (raw LaTeX / other
-      // encodings) before transforming: MML2OMML.XSL's catch-all template
-      // would otherwise recurse into it and leak stray text into the OMML.
+      // encodings) before converting — they're not needed and the
+      // converter doesn't understand them (logs a harmless warning
+      // otherwise).
       const clean = mathEl.cloneNode(true);
       clean.querySelectorAll("annotation, annotation-xml").forEach((a) => a.remove());
 
-      const fragment = xsltProcessor.transformToFragment(clean, document);
-      const oMathEl = fragment && fragment.firstElementChild;
-      if (!oMathEl) return null;
+      const mathMlString = new XMLSerializer().serializeToString(clean);
+      const ommlXml = MathML2OMML.mml2omml(mathMlString);
+      if (!ommlXml) return null;
 
-      // The transform can "succeed" (return a well-formed <m:oMath>) while
-      // actually matching none of the MathML it was given — KaTeX's MathML
-      // output uses nesting/attributes this particular stylesheet doesn't
-      // always recognize (e.g. some \sqrt, \frac, or Greek-letter
-      // structures), so certain formulas silently come out as an empty
-      // shell. An empty OMML node is *worse* than no OMML: Word/WPS render
-      // it as literally nothing, and the code never reaches the plain-text
-      // fallback below because "we got an element back" looked like
-      // success. Guard against that by requiring actual rendered content
-      // (any non-whitespace text somewhere inside, e.g. inside <m:t>) —
-      // otherwise treat it the same as a failed transform.
-      const hasRenderedContent = (oMathEl.textContent || "").replace(/\s+/g, "").length > 0;
-      if (!hasRenderedContent) {
-        console.warn("Chuyển MathML sang OMML ra kết quả rỗng (không khớp cấu trúc) — dùng văn bản LaTeX thay thế.", clean.outerHTML || clean.textContent);
+      // Guard against a silently empty conversion (no rendered content) —
+      // an empty OMML node is worse than none: Word/WPS render it as
+      // literally nothing instead of falling back to the LaTeX text below.
+      const strippedText = ommlXml.replace(/<[^>]+>/g, "").replace(/\s+/g, "");
+      if (!strippedText) {
+        console.warn("Chuyển MathML sang OMML ra kết quả rỗng — dùng văn bản LaTeX thay thế.", mathMlString);
         return null;
       }
 
-      if (!oMathEl.getAttribute("xmlns:m")) oMathEl.setAttribute("xmlns:m", OMML_NS);
-      return new XMLSerializer().serializeToString(oMathEl);
+      return ommlXml.includes("xmlns:m") ? ommlXml : ommlXml.replace("<m:oMath", `<m:oMath xmlns:m="${OMML_NS}"`);
     } catch (e) {
       console.warn("Chuyển MathML sang OMML thất bại cho một công thức, dùng văn bản LaTeX thay thế.", e);
       return null;
@@ -980,11 +953,9 @@
     }
 
     setButtonLoading(btnExport, true);
-    statusHint.textContent = "Đang chuẩn bị công thức toán…";
+    statusHint.textContent = "Đang dựng file Word…";
 
     try {
-      await ensureXsltProcessor();
-      statusHint.textContent = "Đang dựng file Word…";
       const children = buildDocxChildren(previewContent);
       const doc = new docx.Document({
         creator: "Sang",
